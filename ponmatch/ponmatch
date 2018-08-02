@@ -1,0 +1,130 @@
+#!/usr/bin/env python
+"""
+Usage:
+    ponmatch --help
+    ponmatch project.po --locale az --apply --debug
+    ponmatch project.po --locale az --include-fuzzy --similarmatch > matches.csv
+"""
+
+import argparse
+from pathlib import Path
+import requests
+import polib
+from typing import Generator, Optional
+import logging
+import sys
+
+parser = argparse.ArgumentParser(description='Find translation for missing po messages.')
+parser.add_argument('project', type=str,
+                    help="Path of the po file.")
+parser.add_argument('-l', '--locale', dest='locale', required=True, type=str,
+                    help="Locale of the target. Origin should be English.")
+parser.add_argument('--include-fuzzy', action='store_true',
+                    help="Include fuzzy translations.")
+parser.add_argument('--similarmatch', action='store_true',
+                    help="Include translations with lower quality.")
+parser.add_argument('--apply', action='store_true',
+                    help="Apply results directly to the po file (please, review changes before submitting).")
+parser.add_argument('--debug', action='store_true',
+                    help="Set log level to DEBUG")
+
+logger = logging.getLogger('ponmatch')
+logger.setLevel(logging.WARNING)
+logger.addHandler(logging.StreamHandler(sys.stdout))
+
+PONTOON_MEMORY_URL = "https://pontoon.mozilla.org/translation-memory/"
+
+
+def missing_po_strings(po_object: polib.POFile, include_fuzzy=False) -> Generator[polib.POEntry, None, None]:
+    """
+    Get list of missing and fuzzy messages from the po file.
+    :param po_object: po object
+    :param include_fuzzy: by default, fuzzy messages will be ignored
+    :return: List of PoEntry objects matching the query
+    """
+
+    for po_entry in po_object.untranslated_entries():
+        if not po_entry.msgid:
+            continue
+        if po_entry.msgid_plural:
+            # @TODO
+            logger.warning("Plural messages are not supported yet.")
+            continue
+        if not po_entry.msgstr:
+            yield po_entry
+    if include_fuzzy:
+        for po_entry in po_object.fuzzy_entries():
+            if not po_entry.msgid:
+                continue
+            if po_entry.msgid_plural:
+                logger.warning("Plural messages are not supported yet.")
+                continue
+            yield po_entry
+
+
+def pontoon_machine_translation(text: polib.POEntry, locale: str, similarmatch: bool=False) -> Optional[dict]:
+    """
+    Get matches from pontoon's machine translation.
+    :param text: po entry
+    :param locale: target locale
+    :param similarmatch: show messages with quality less than 100%
+    :return: {source: original, translations: [{translation: match, quality: decimal_quality, count: usage_count]}}
+    """
+    result = {
+        'source': text, 'translations': []
+    }
+    logger.debug("Getting translation for {text}".format(text=text.msgid))
+    response = requests.get(PONTOON_MEMORY_URL, params={'text': text.msgid, 'locale': locale, 'pk': ''})
+    if response.status_code != 200:
+        logger.warning("Network error on {}".format(text.msgid))
+        return None
+    for translation in response.json():
+        if not similarmatch and translation['quality'] < 100:
+            continue
+        result['translations'].append({
+            'translation': translation['target'],
+            'quality': translation['quality'],
+            'count': translation['count']
+        })
+    # sort results by count and then by quality in decreasing order
+    if not result['translations']:
+        return None
+    result['translations'] = sorted(result['translations'], key=lambda k: (-k['count'], -k['quality']))
+    return result
+
+
+def print_results(po_entries):
+    print("Source\tMatching Quality\tTranslation")
+    for po_entry in po_entries:
+        for translation in po_entry['translations']:
+            print("{source}\t({quality}%:{count})\t{translation}".format(
+                source=po_entry['source'].msgid,
+                translation=translation['translation'],
+                quality=round(translation['quality']),
+                count=translation['count']
+            ))
+        print("")
+
+
+if __name__ == '__main__':
+    args = vars(parser.parse_args())
+    if args['debug']:
+        logger.setLevel(logging.DEBUG)
+
+    project_file = Path(args['project'])
+    if not project_file.is_file():
+        raise ValueError("Project file not found!")
+
+    po = polib.pofile(project_file.resolve(), wrapwidth=200)
+    entries = []
+
+    for entry in missing_po_strings(po, include_fuzzy=args['include_fuzzy']):
+        entry_translation = pontoon_machine_translation(entry, args['locale'], args['similarmatch'])
+        if entry_translation:
+            if args['apply']:
+                entry.msgstr = entry_translation['translations'][0]['translation']
+                po.save()
+            else:
+                entries.append(entry_translation)
+    if not args['apply']:
+        print_results(entries)
