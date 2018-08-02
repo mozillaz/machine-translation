@@ -19,6 +19,8 @@ parser.add_argument('project', type=str,
                     help="Path of the po file.")
 parser.add_argument('-l', '--locale', dest='locale', required=True, type=str,
                     help="Locale of the target. Origin should be English.")
+parser.add_argument('-s', '--skip', dest='skip_lines', default=0, type=int,
+                    help="Skip lines")
 parser.add_argument('--include-fuzzy', action='store_true',
                     help="Include fuzzy translations.")
 parser.add_argument('--similarmatch', action='store_true',
@@ -35,15 +37,17 @@ logger.addHandler(logging.StreamHandler(sys.stdout))
 PONTOON_MEMORY_URL = "https://pontoon.mozilla.org/translation-memory/"
 
 
-def missing_po_strings(po_object: polib.POFile, include_fuzzy=False) -> Generator[polib.POEntry, None, None]:
+def missing_po_strings(po_object: polib.POFile, include_fuzzy=False, skip_lines: int=0) -> Generator[polib.POEntry, None, None]:
     """
     Get list of missing and fuzzy messages from the po file.
     :param po_object: po object
     :param include_fuzzy: by default, fuzzy messages will be ignored
+    :param skip_lines: skip N lines
     :return: List of PoEntry objects matching the query
     """
-
     for po_entry in po_object.untranslated_entries():
+        if skip_lines and po_entry.linenum < skip_lines:
+            continue
         if not po_entry.msgid:
             continue
         if po_entry.msgid_plural:
@@ -73,7 +77,7 @@ def pontoon_machine_translation(text: polib.POEntry, locale: str, similarmatch: 
     result = {
         'source': text, 'translations': []
     }
-    logger.debug("Getting translation for {text}".format(text=text.msgid))
+    logger.debug("Getting translation for {line}. {text}".format(line=text.linenum, text=text.msgid))
     response = requests.get(PONTOON_MEMORY_URL, params={'text': text.msgid, 'locale': locale, 'pk': ''})
     if response.status_code != 200:
         logger.warning("Network error on {}".format(text.msgid))
@@ -118,7 +122,7 @@ if __name__ == '__main__':
     po = polib.pofile(project_file.resolve(), wrapwidth=200)
     entries = []
 
-    for entry in missing_po_strings(po, include_fuzzy=args['include_fuzzy']):
+    for entry in missing_po_strings(po, include_fuzzy=args['include_fuzzy'], skip_lines=args['skip_lines']):
         entry_translation = pontoon_machine_translation(entry, args['locale'], args['similarmatch'])
         if entry_translation:
             if args['apply']:
